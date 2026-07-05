@@ -14,6 +14,9 @@ from core.guardian_network import (
     send_emergency_alert, get_alert_status, get_user_alerts, set_alert_preferences,
     get_alert_preferences, quick_setup_guardian_network
 )
+from core.location_services import (
+    notify_nearby_oscs, get_osc_alert_log, get_alerts_by_sos
+)
 
 router = APIRouter(prefix="/api/emergency", tags=["emergency"])
 
@@ -97,15 +100,31 @@ async def trigger_sos(req: SOSRequest):
         )
         
         police_stations = []
+        osc_notifications = []
         if req.latitude and req.longitude:
             police_stations = find_nearby_police_stations(req.latitude, req.longitude, radius_km=5.0)
-        
+
+            # ── notify nearby One Stop Centres ─────────────────────────────
+            # Works without any government app — uses our own location database.
+            # If an OSC has a webhook_url configured, it gets an HTTP POST immediately.
+            # Otherwise the alert is stored for polling via GET /api/emergency/osc-alerts.
+            osc_notifications = notify_nearby_oscs(
+                lat=req.latitude,
+                lon=req.longitude,
+                sos_alert_id=alert.alert_id,
+                message=req.message or "SOS — I need immediate help!",
+                severity="critical",
+                radius_km=50.0,
+                max_oscs=3,
+            )
+
         return {
             "status": "alert_sent", "alert_id": alert.alert_id,
             "guardians_notified": len(alert.sent_to),
             "delivery_status": alert.delivery_status,
             "share_link": share_link, "location": location_data,
             "nearby_police": police_stations,
+            "osc_notifications": osc_notifications,
             "emergency_numbers": [
                 {"name": "Women's Helpline", "number": "181"},
                 {"name": "Police", "number": "100"},
@@ -278,3 +297,53 @@ async def get_alerts(user_id: str, limit: int = 10):
                    "guardians_notified": len(a.sent_to), "delivery_status": a.delivery_status,
                    "created_at": a.created_at, "has_location": a.location_data is not None} for a in alerts]
     }
+
+
+# ── OSC alert polling endpoints ───────────────────────────────────────────────
+# These allow an OSC dashboard (or admin) to *pull* emergency alerts
+# when no live webhook is configured on their side.
+
+@router.get("/osc-alerts")
+async def get_all_osc_alerts():
+    """
+    Return all OSC-bound emergency alerts logged by this server.
+    OSC dashboards can poll this endpoint to receive SOS events
+    even without a webhook configured on the government side.
+    """
+    alerts = get_osc_alert_log()
+    return {
+        "total": len(alerts),
+        "alerts": alerts,
+    }
+
+
+@router.get("/osc-alerts/{osc_id}")
+async def get_osc_alerts_by_id(osc_id: str):
+    """
+    Return emergency alerts for a specific OSC (by its id field from
+    sos_locations_india.json, e.g. 'osc-one-stop-centre-howrah').
+    Intended for OSC-specific dashboards to poll their own queue.
+    """
+    alerts = get_osc_alert_log(osc_id=osc_id)
+    if not alerts and osc_id not in {a["osc_id"] for a in get_osc_alert_log()}:
+        raise HTTPException(status_code=404, detail=f"No alerts found for OSC id '{osc_id}'")
+    return {
+        "osc_id": osc_id,
+        "total": len(alerts),
+        "alerts": alerts,
+    }
+
+
+@router.get("/osc-alerts/by-sos/{sos_alert_id}")
+async def get_osc_alerts_by_sos(sos_alert_id: str):
+    """
+    Return all OSC notifications that were fired as part of a specific
+    SOS alert_id — useful for the user to see which OSCs were contacted.
+    """
+    alerts = get_alerts_by_sos(sos_alert_id)
+    return {
+        "sos_alert_id": sos_alert_id,
+        "osc_count": len(alerts),
+        "osc_notifications": alerts,
+    }
+
